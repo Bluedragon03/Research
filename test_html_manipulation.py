@@ -9,28 +9,33 @@ def mirror_layout_rtl(input_filepath, output_filepath):
     with open(input_filepath, 'r', encoding='utf-8') as f:
         soup = BeautifulSoup(f.read(), 'html.parser')
 
-    if soup.html:
-        soup.html['dir'] = 'rtl'
+    # Precision CSS targeting only top-level navigation and structural flex rows
+    precision_mirror_css = """
+    /* 1. Only reverse top-level navigation and explicit row classes */
+    header, nav, .row, .flex-row, ul.menu, .nav-items {
+        display: flex !important;
+        flex-direction: row-reverse !important;
+    }
 
-    rtl_override_css = """
-    /* Force Right-to-Left text alignment and component flipping */
-    body {
-        direction: rtl !important;
+    /* 2. Reverse header/navigation text and float alignment */
+    header, nav {
         text-align: right !important;
     }
-    
-    /* Reverse float directions */
+
+    /* 3. Re-enforce original width and block display for main content containers */
+    main, section, article, .container, .card, [class*="card"], [class*="wrapper"] {
+        flex-direction: column; /* Preserve vertical stacking inside cards */
+        width: 100%;
+        max-width: 100%;
+    }
+
+    /* 4. Flip floating elements safely */
     [style*="float: left"] { float: right !important; }
     [style*="float: right"] { float: left !important; }
-
-    /* Reverse margin and padding directions */
-    *:not(script):not(style) {
-        margin-right: auto;
-    }
     """
 
-    style_tag = soup.new_tag('style', id='rtl-mirror-style')
-    style_tag.string = rtl_override_css
+    style_tag = soup.new_tag('style', id='precision-mirror-rules')
+    style_tag.string = precision_mirror_css
 
     if soup.head:
         soup.head.append(style_tag)
@@ -42,7 +47,6 @@ def update_color_scheme_vars(input_filepath, output_filepath):
     with open(input_filepath, 'r', encoding='utf-8') as f:
         soup = BeautifulSoup(f.read(), 'html.parser')
 
-    # CSS to force dark mode and high-contrast elements
     dark_mode_css = """
     body {
         background-color: #121212 !important;
