@@ -1,0 +1,5 @@
+phish_pull.py - Pulls 500 phishing sites from online-valid.json from phishtank.com and saves new websites to Website_List.csv.
+scam_pull.py - Pulls the 30 latest reported websites from scamner.com and saves new websites to Website_List.csv. The latest page updates about once a day so the number of sites you can get in one day is limited.
+scraper.py - Iterates through a csv file containing links to scrape and collects images, html files, scripts, metadata, tls information, dns information, rdap information, and other various domain metrics from the sites. All of the results are saved to results.csv in the results folder.
+repeat_scraper.py - Does the same thing as scraper.py and then sleeps for 24 hours. rather then saving results.csv to the results folder, the individual site results are saved in the same folder as the other files for the site.
+test_html_manipulation.py - Currently takes the provide path to a specific scraper result and creates copies of the html file with various perturbations. Currently the path can be changed by changing the html_path variable.
