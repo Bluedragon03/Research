@@ -29,6 +29,10 @@ import io
 from datetime import datetime, timezone
 import functools
 import time
+import tldextract
+import logging
+import sys
+import threading
 
 FREE_CA_ISSUERS = [
     "Let's Encrypt", "ZeroSSL", "Cloudflare", "Google Trust Services", "Amazon", 
@@ -64,7 +68,7 @@ MAX_JS_FILES = 10
 MAX_SUSPICIOUS_FILES = 10
 MAX_IMAGES_TO_DOWNLOAD = 10 # Variable for number of images
 
-SUSPICIOUS_EXTENSIONS = {".exe", ".bin", ".dll", ".scr", ".apk", ".vbs", ".rb", ".pl", ".py", ".run", ".sh", ".pkg", ".dmg", ".app", ".pif", ".cpl", ".jse", ".ps1", ".cmd", ".bat", ".msi"}
+SUSPICIOUS_EXTENSIONS = {".exe", ".bin", ".dll", ".scr", ".apk", ".vbs", ".rb", ".pl", ".py", ".run", ".sh", ".pkg", ".dmg", ".app", ".pif", ".cpl", ".jse", ".ps1", ".cmd", ".bat", ".msi", ".php"}
 
 # List of user agents to choose from
 USER_AGENTS = [
@@ -81,6 +85,9 @@ USER_AGENTS = [
 URL_TIMESTAMPS = {}
 save_paths = {}
 failed_attempts = {}
+SITE_CATEGORY = {}
+
+logger = logging.getLogger("scraper")
 
 def get_random_user_agent():
     """Selects a random user agent from the list."""
@@ -124,6 +131,60 @@ def get_filename_from_url(url, default_name):
     filename = re.sub(r'[\\/:*?"<>|]', '_', filename) # Replace forbidden chars with underscore
     filename = filename.strip() # Remove leading/trailing whitespace
     return filename
+
+def unique_filename(url, fallback):
+    path = urlparse(url).path
+    stem, ext = os.path.splitext(os.path.basename(path))
+    return f"{stem or fallback}_{hashlib.sha1(url.encode()).hexdigest()[:8]}{ext}"
+
+class LazyFileHandler(logging.FileHandler):
+    """Creates the log folder/file only when the first record is written."""
+    def _open(self):
+        os.makedirs(os.path.dirname(self.baseFilename), exist_ok=True)
+        return super()._open()
+
+
+def setup_error_logging(results_dir=OUTPUT_DIR):
+    run_started = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+    log_path = os.path.join(results_dir, "error_logs", f"errors_{run_started}.log")
+
+    fmt = logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(threadName)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    file_handler = LazyFileHandler(log_path, encoding="utf-8", delay=True)
+    file_handler.setLevel(logging.WARNING)      # warnings + errors go to the file
+    file_handler.setFormatter(fmt)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)      # still see everything in the console
+    console_handler.setFormatter(fmt)
+
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    logger.propagate = False
+
+    # Uncaught exceptions: main thread, worker threads
+    def _excepthook(exc_type, exc, tb):
+        logger.critical("Uncaught exception", exc_info=(exc_type, exc, tb))
+    sys.excepthook = _excepthook
+    threading.excepthook = lambda args: logger.critical(
+        f"Uncaught exception in thread {args.thread.name}",
+        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+    )
+
+    logger.info(f"Run started {run_started}; errors will be logged to {log_path}")
+    return log_path
+
+def install_asyncio_error_logging():
+    def _handler(loop, context):
+        exc = context.get("exception")
+        logger.error(f"Asyncio error: {context.get('message')}",
+                     exc_info=(type(exc), exc, exc.__traceback__) if exc else None)
+    asyncio.get_running_loop().set_exception_handler(_handler)
 
 class WebsiteCrawler:
     """
@@ -192,22 +253,22 @@ class WebsiteCrawler:
             self.session = None
             print("aiohttp client session closed.")
 
-    async def _download_file(self, url, save_path):
+    async def _download_file(self, url, save_path, referer=None):
         """Internal helper to download a single file using the shared aiohttp session."""
         try:
-            async with self.session.get(url, timeout=self.download_timeout) as resp:
-                if resp.status == 200:
-                    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                    with open(save_path, "wb") as f:
-                        f.write(await resp.read())
-                else:
-                    print(f"⚠️ Failed to download {url}: HTTP Status {resp.status}")
-        except aiohttp.ClientError as e:
-            print(f"❌ Client error downloading file {url}: {e}")
-        except asyncio.TimeoutError:
-            print(f"❌ Timeout downloading file {url}")
+            headers = {"Referer": referer} if referer else {}
+            resp = await self.context.request.get(url, headers=headers,
+                                                timeout=self.download_timeout * 1000)
+            if resp.ok:
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                with open(save_path, "wb") as f:
+                    f.write(await resp.body())
+            else:
+                print(f"⚠️ Failed to download {url}: HTTP {resp.status}")
+                logger.warning(f"Download failed (HTTP {resp.status}): {url}  [page: {referer}]")
         except Exception as e:
-            print(f"❌ General error downloading file {url}: {e}")
+            print(f"❌ Error downloading {url}: {e}")
+            logger.exception(f"Download error: {url}  [page: {referer}]")
 
     async def crawl_url(self, url: str):
         """
@@ -223,17 +284,16 @@ class WebsiteCrawler:
 
         URL_TIMESTAMPS[url] = timestamp
 
-        save_path = os.path.join(self.output_dir, url, timestamp)
-        os.makedirs(save_path, exist_ok=True)
+        if SITE_CATEGORY[url] == "phishing" or SITE_CATEGORY[url] == "scam":
+            save_path = os.path.join(self.output_dir, SITE_CATEGORY[url], url, timestamp)
+        else:
+            save_path = os.path.join(self.output_dir,"other", url, timestamp)
 
         # Create sub-directories
         js_folder = os.path.join(save_path, "js_scripts")
         suspicious_folder = os.path.join(save_path, "suspicious_files")
-        images_folder = os.path.join(save_path, "images")
-
-        os.makedirs(js_folder, exist_ok=True)
-        os.makedirs(suspicious_folder, exist_ok=True)
-        os.makedirs(images_folder, exist_ok=True)
+        # currently unneeded
+        #images_folder = os.path.join(save_path, "images")
 
         if self.browser is None or self.context is None or self.session is None:
             print("Crawler not initialized. Calling initialize()...")
@@ -285,16 +345,20 @@ class WebsiteCrawler:
             response = await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout)
             if not response:
                 print(f"⚠️ No primary response received for {url}.")
+                logger.warning(f"No primary response received for {url}")
                 return
 
             status_code = response.status
             is_non_200 = (status_code != 200)
 
             if is_non_200:
-                if not failed_attempts[url]:
-                    failed_attempts[url] = 1
-                else:
-                    failed_attempts[url] = failed_attempts[url] + 1
+                failed_attempts[url] = failed_attempts.get(url, 0) + 1
+                logger.warning(f"{url} returned HTTP {status_code}")
+                return
+
+            if is_non_200 == False:
+                for folder in (save_path, js_folder, suspicious_folder):
+                    os.makedirs(folder, exist_ok=True)
 
             # Wait for the main content to load fully
             await page.wait_for_selector("body", state="visible", timeout=10000)
@@ -308,7 +372,24 @@ class WebsiteCrawler:
 
             # --- Core Artifacts Capture ---
             print(" Capturing screenshot and source code.")
+
+            # top of page
+            await page.evaluate("window.scrollTo(0, 0)")
+            await page.wait_for_timeout(300)
+            await page.screenshot(path=os.path.join(save_path, "screenshot_top.png"), full_page=False)
+
+            # full page
             await page.screenshot(path=os.path.join(save_path, "screenshot.png"), full_page=True)
+
+            # bottom of page
+            await page.evaluate("window.scrollTo(0, (document.scrollingElement || document.body).scrollHeight)")
+            await page.wait_for_timeout(1000)
+            await page.evaluate("window.scrollTo(0, (document.scrollingElement || document.body).scrollHeight)")
+            await page.wait_for_timeout(500)
+            await page.screenshot(path=os.path.join(save_path, "screenshot_bottom.png"), full_page=False)
+
+            # return page to original state
+            await page.evaluate("window.scrollTo(0, 0)")
 
             rendered_html = await page.content()
             with open(os.path.join(save_path, "rendered_html.html"), "w", encoding="utf-8") as f:
@@ -410,17 +491,21 @@ class WebsiteCrawler:
 
             # --- JS File Download ---
             print(" Downloading JS files.")
+            JS_EXTENSIONS = {".js", ".mjs"}
+
             script_urls = await page.eval_on_selector_all(
-                "script[src]",
-                "els => els.map(e => e.src).filter(src => src)"
+                "script[src]", "els => els.map(e => e.src).filter(Boolean)"
             )
-            script_urls = [url for url in script_urls if urlparse(url).netloc == fqdn]
-            script_urls = script_urls[:self.max_js_files]
+            script_urls = [
+                u for u in dict.fromkeys(script_urls)
+                if urlparse(u).scheme in ("http", "https")
+                and os.path.splitext(urlparse(u).path)[1].lower() in JS_EXTENSIONS
+            ][:self.max_js_files]
+            print(f"   JS to download: {len(script_urls)}")
 
             for idx, js_url in enumerate(script_urls):
-                filename = get_filename_from_url(js_url, f"script_{idx + 1}.js")
-                save_js_path = os.path.join(js_folder, filename)
-                await self._download_file(js_url, save_js_path)
+                filename = unique_filename(js_url, f"script_{idx + 1}")
+                await self._download_file(js_url, os.path.join(js_folder, filename), referer=response.url)
 
             # --- Image Download ---
             print(" Downloading images.")
@@ -432,8 +517,10 @@ class WebsiteCrawler:
             absolute_image_urls = []
             for img_url in image_urls:
                 absolute_img_url = urljoin(base_url_for_images, img_url)
-                if urlparse(absolute_img_url).netloc == fqdn:
+                if urlparse(absolute_img_url).scheme in ("http", "https"):
                     absolute_image_urls.append(absolute_img_url)
+            absolute_image_urls = list(dict.fromkeys(absolute_image_urls))
+            print(f"   Images to download: {len(absolute_image_urls)}")
             
             images_to_download = absolute_image_urls[:self.max_images_to_download]
             
@@ -446,23 +533,50 @@ class WebsiteCrawler:
                     continue
                 save_img_path = os.path.join(base_output_dir, rel_path)
                 os.makedirs(os.path.dirname(save_img_path), exist_ok=True)
-                await self._download_file(img_url, save_img_path)
+                await self._download_file(img_url, save_img_path, referer=response.url)
 
             # --- Suspicious File Check ---
             print(" Checking for suspicious files.")
-            suspicious_urls = []
-            for ext in self.suspicious_extensions:
-                selector = f'[src$="{ext}" i], [href$="{ext}" i]'
-                # Playwright's page.eval_on_selector_all can return None for elements, so filter
-                found_urls = await page.eval_on_selector_all(selector, "els => els.map(e => e.src || e.href).filter(Boolean)")
-                suspicious_urls.extend(found_urls)
-
-            suspicious_urls = [url for url in suspicious_urls if urlparse(url).netloc == fqdn][:self.max_suspicious_files]
+            exts = {(e if e.startswith(".") else "." + e).lower() for e in self.suspicious_extensions}
+            all_refs = await page.eval_on_selector_all(
+                "[src], [href]", "els => els.map(e => e.src || e.href).filter(Boolean)"
+            )
+            suspicious_urls = [
+                u for u in dict.fromkeys(all_refs)
+                if urlparse(u).scheme in ("http", "https")
+                and os.path.splitext(urlparse(u).path)[1].lower() in exts
+            ][:self.max_suspicious_files]
+            print(f"   Suspicious files to download: {len(suspicious_urls)}")
 
             for idx, sus_url in enumerate(suspicious_urls):
-                filename = get_filename_from_url(sus_url, f"suspicious_{idx + 1}{os.path.splitext(sus_url)[1]}")
-                save_sus_path = os.path.join(suspicious_folder, filename)
-                await self._download_file(sus_url, save_sus_path)
+                filename = unique_filename(sus_url, f"suspicious_{idx + 1}")
+                await self._download_file(sus_url, os.path.join(suspicious_folder, filename), referer=response.url)
+
+            # --- robots.txt ---
+            print(" Fetching robots.txt.")
+            robots_found = False
+            parsed_final = urlparse(response.url)          # use the post-redirect host
+            robots_url = f"{parsed_final.scheme}://{parsed_final.netloc}/robots.txt"
+            try:
+                robots_resp = await self.context.request.get(robots_url,
+                                                            timeout=self.download_timeout * 1000)
+                if robots_resp.ok:
+                    body = await robots_resp.body()
+                    content_type = robots_resp.headers.get("content-type", "").lower()
+                    # Many sites return their HTML 404 page with status 200; skip those
+                    looks_like_html = "html" in content_type or body.lstrip()[:15].lower().startswith((b"<!doctype", b"<html"))
+                    if body.strip() and not looks_like_html:
+                        with open(os.path.join(save_path, "robots.txt"), "wb") as f:
+                            f.write(body)
+                        robots_found = True
+                        print(f"   Saved robots.txt ({len(body)} bytes)")
+                    else:
+                        print("   robots.txt not present (empty or HTML error page)")
+                else:
+                    print(f"   No robots.txt (HTTP {robots_resp.status})")
+            except Exception as e:
+                print(f"   Could not fetch robots.txt: {e}")
+                logger.exception(f"Could not fetch robots.txt: {robots_url}")
 
             # --- Final Metadata ---
             metadata = {
@@ -475,6 +589,8 @@ class WebsiteCrawler:
                 "suspicious_files_count": len(suspicious_urls),
                 "images_downloaded_count": len(images_to_download),
                 "total_network_transactions": len(network_transactions),
+                "robots_txt_found": robots_found,
+                "robots_txt_url": robots_url,
                 "social_facebook_links_count": len(fb_links),
                 "social_twitter_links_count": len(tw_links),
                 "social_instagram_links_count": len(ig_links),
@@ -492,6 +608,7 @@ class WebsiteCrawler:
 
         except Exception as e:
             print(f" Error crawling {url}: {e}")
+            logger.exception(f"Error crawling {url}")
 
         finally:
             await page.close()
@@ -501,6 +618,8 @@ async def main(urls, concurrency=5):
     Main function to orchestrate crawling of multiple URLs with concurrency.
     Manages a single WebsiteCrawler instance.
     """
+    install_asyncio_error_logging()
+
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     crawler = WebsiteCrawler(output_dir=OUTPUT_DIR, headless=HEADLESS,
                              max_images_to_download=MAX_IMAGES_TO_DOWNLOAD)
@@ -541,7 +660,7 @@ def get_tls_info(hostname, port=443):
     try:
         context = ssl.create_default_context()
         
-        with socket.create_connection((hostname, port)) as sock:
+        with socket.create_connection((hostname, port), timeout=10) as sock:
             context.minimum_version = ssl.TLSVersion.TLSv1_3
             
             with context.wrap_socket(sock, server_hostname=hostname) as ssock:
@@ -620,6 +739,7 @@ def get_tls_info(hostname, port=443):
 
     except Exception as e:
         # Handle the case where the hostname is not found or connection fails
+        logger.warning(f"TLS lookup failed for {hostname}:{port}: {e}")
         return {
             "TLS_enabled": False,
             "error": str(e)
@@ -712,6 +832,9 @@ def get_dns_info(domain):
         
         except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, Exception) as e:
             all_records[rtype] = "No record found"
+
+        except Exception as e:
+            logger.warning(f"DNS {rtype} query failed for {domain}: {e}")
             
     # Get A record count and host info
     if 'A' in all_records and all_records['A'] != "No record found":
@@ -745,7 +868,8 @@ def get_rdap_info(domain, max_retries=4, base_delay=5):
     for attempt in range(max_retries):
         # 1. RDAP lookup
         try:
-            domain_name, tld = domain.rsplit(".", 1)
+            ext = tldextract.extract(domain)
+            domain_name, tld = ext.domain, ext.suffix
         
             rdap_response = whodap.lookup_domain(
                 domain=domain_name,
@@ -763,14 +887,17 @@ def get_rdap_info(domain, max_retries=4, base_delay=5):
                 # Exponential delay with randomized jitter: 5s, 10s, 20s (+ random 1-3s)
                 sleep_time = (base_delay * (2 ** attempt)) + random.uniform(1, 3)
                 print(f"[!] Rate limit hit for {domain} (Attempt {attempt + 1}/{max_retries}). Sleeping for {sleep_time:.1f}s...")
+                logger.warning(f"RDAP rate limit for {domain} (attempt {attempt + 1}/{max_retries}); sleeping {sleep_time:.1f}s")
                 time.sleep(sleep_time)
             else:
                 # Non-rate-limit error (e.g. domain non-existent); don't retry endlessly
                 result_data["errors"]["rdap"] = err_msg
                 print(f"[-] RDAP error for {domain}: {e}")
+                logger.error(f"RDAP error for {domain}: {e}")
                 return result_data
 
     result_data["errors"]["rdap"] = "Failed after maximum rate-limit retries."
+    logger.error(f"RDAP failed for {domain} after {max_retries} rate-limit retries")
     return result_data
 
 def parse_rdap_creation_date(rdap_dict: dict) -> datetime | None:
@@ -845,6 +972,7 @@ def analyze_domain_metrics(site: str) -> dict:
             domain_age_days = (now - creation_date).days
     except Exception as e:
         print(f"[-] RDAP calculation failed for {registered_domain}: {e}")
+        logger.exception(f"RDAP calculation failed for {registered_domain}")
 
     return {
         "tranco_top_1m": tranco_top_1m,
@@ -873,108 +1001,86 @@ def get_metadata_from_scrapper (file_path):
         print(f"❌ Metadata file not found at: {full_path}")
         return {}
 
-def flatten_dict(d, prefix=''):
-    """
-    Recursively flattens a nested dictionary and prefixes keys.
-    Example: {'a': {'b': 1}} -> {'a_b': 1}
-    """
-    items = []
-    for k, v in d.items():
-        new_key = f"{prefix}_{k}" if prefix else k
-        if isinstance(v, dict):
-            items.extend(flatten_dict(v, new_key).items())
-        else:
-            if isinstance(v, (list, tuple)):
-                v = "|".join(map(str, v))
-            elif isinstance(v, datetime):
-                v = v.isoformat()
-            items.append((new_key, v))
-    return dict(items)
+def write_json(path, data):
+    """Save a function's return value as-is."""
+    with open(path, "w", encoding="utf-8") as f:
+        # default=str covers datetimes in the RDAP response and anything else non-JSON
+        json.dump(data, f, indent=2, default=str, ensure_ascii=False)
+
 
 def extract_urls(csv_file_path):
-    urls = []
+    entries = []
     with open(csv_file_path, mode="r", encoding="utf-8-sig") as f:
-        reader = csv.reader(f)
+        reader = csv.DictReader(f)
+        reader.fieldnames = [h.strip().lower() for h in reader.fieldnames]
+    
         for row in reader:
-            if not row:
+            url = (row.get("url") or "").strip()
+            if not url:
                 continue
+            site_type = (row.get("type") or "").strip()
+            entries.append((url, site_type))
+    
+    urls = []
+    for entry in entries:
+        urls.append(entry[0])
+        SITE_CATEGORY[entry[0]] = entry[1]
 
-            cell = row[0].strip()
-
-            # Checking for these keys. Other keys can be added if needed
-            if cell and not cell.lower() in ("url", "urls", "site", "domain"):
-                urls.append(cell)
     return urls
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process URLs from a CSV file.")
     parser.add_argument("csv_path", nargs="?", default=None, help="Path to the input CSV file containing URLs")
     args = parser.parse_args()
-    
-    while 1 == 1:
+
+    while True:
+        setup_error_logging(OUTPUT_DIR)
+
+        save_paths.clear()
+
         if args.csv_path and os.path.exists(args.csv_path):
-                URLS_TO_TEST = extract_urls(args.csv_path)
+            URLS_TO_TEST = extract_urls(args.csv_path)
         else:
             if args.csv_path:
-                print(
-                    f"Warning: File '{args.csv_path}' not found. Using default URL list."
-                )
+                logger.warning(f"File '{args.csv_path}' not found. Using default URL list.")
             URLS_TO_TEST = ["https://example.com/"]
-        
+
+        URLS_TO_TEST = [u for u in URLS_TO_TEST if failed_attempts.get(u, 0) < 3]
+
         if not URLS_TO_TEST:
-            print("No URLs found to process.")
+            logger.error("No URLs found to process.")
             exit()
 
         max_urls_for_parallel_process = 5
-
         asyncio.run(main(URLS_TO_TEST, concurrency=max_urls_for_parallel_process))
 
         for url in URLS_TO_TEST:
             site = formalize_domain(url)
-            #fqdn, fqdn_hash = get_fqdn_and_hash(site)
-            #url_hash = get_url_hash(site)
-            if not save_paths.get(url) or not os.path.exists(os.path.join(save_paths.get(url), "metadata.txt")):
-                print(f"⚠️ Skipping metrics for {url}: Crawl path or metadata.txt not found.")
+            save_path = save_paths.get(url)
+
+            if not save_path or not os.path.exists(os.path.join(save_path, "metadata.txt")):
+                logger.warning(f"Skipping metrics for {url}: crawl path or metadata.txt not found")
                 continue
-            metadata_path = save_paths.get(url) + "/metadata.txt"
 
             with ThreadPoolExecutor() as executor:
-                A1 = executor.submit(get_tls_info, site)
-                A2 = executor.submit(get_dns_info, site)
-                A3 = executor.submit(get_rdap_info, site)
-                A4 = executor.submit(analyze_domain_metrics, site)
-                A5 = executor.submit(get_metadata_from_scrapper, metadata_path)
+                futures = {
+                    "tls": executor.submit(get_tls_info, site),
+                    "dns": executor.submit(get_dns_info, site),
+                    "whois": executor.submit(get_rdap_info, site),
+                    "domain_metrics": executor.submit(analyze_domain_metrics, site),
+                }
 
-                cert_info = A1.result()
-                dns_info = A2.result()
-                rdap_info = A3.result()
-                domain_metrics = A4.result()
-                metadata = A5.result()
+            for name, fut in futures.items():
+                try:
+                    data = fut.result()
+                except Exception as e:
+                    logger.exception(f"{name} lookup failed for {url}")
+                    data = {"error": str(e)}
 
-            total_data = {"search_url": url}
-
-            total_data.update(flatten_dict(cert_info or {}, "tls"))
-            total_data.update(flatten_dict(dns_info or {}, "dns"))
-            total_data.update(flatten_dict(rdap_info or {}, "whois"))
-            total_data.update(flatten_dict(domain_metrics or {}, "domain_metrics"))
-            total_data.update(flatten_dict(metadata or {}, "metadata"))
-
-            if total_data:
-                all_keys = set()
-                
-                all_keys.update(total_data.keys())
-
-                with open(f"{save_paths[url]}/results.csv", "w", newline="", encoding="utf-8") as f:
-                        writer = csv.DictWriter(f, fieldnames=sorted(list(all_keys)))
-                        writer.writeheader()
-                        writer.writerow(total_data)
-
-                print(f"Results saved to {save_paths[url]}/results.csv")
-
-            if failed_attempts.get(url)== 3:
-                URLS_TO_TEST.remove(url)
+                write_json(os.path.join(save_path, f"{name}.json"),
+                           {"search_url": url, "result": data})
 
             sleep(3)
 
-        print("finished daily scrape")
+        logger.info("Finished daily scrape")
         sleep(86400)
